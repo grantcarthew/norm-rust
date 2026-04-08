@@ -114,46 +114,67 @@ norm-codec/
 
 ### Lexer (lexer.rs)
 
-Processes the input string line by line. Strips CRLF. Detects BOM and null bytes.
-Classifies each line into a Token:
+Detects BOM and null bytes upfront. Then processes the input as a stream of tokens.
+
+Structural lines (root declarations, section headers, blanks, comments) are identified by inspecting the first non-whitespace characters of each line. CRLF is stripped. Inline comments on structural lines are stripped before classification.
+
+Data rows use `csv-core` for cell splitting. The csv-core state machine handles quoted fields with embedded newlines, doubled-quote escaping, and commas inside quotes. This means a single data row may span multiple lines in the source text — the lexer feeds input to csv-core and accumulates cells until a record boundary is reached.
+
+`#` on a data row is not treated as a comment — it is literal cell content.
+
+Note: csv-core never returns errors; it always produces some output. The lexer must layer its own validation (e.g. detecting malformed quoting) where strict spec compliance requires it.
 
 ```rust
-enum Token<'a> {
+enum Token {
     RootDeclaration { array: bool },
-    SectionHeader { name: &'a str, array: bool },
-    DataRow { cells: Vec<&'a str> },
+    SectionHeader { name: String, array: bool },
+    DataRow { cells: Vec<String> },
     Blank,
     Comment,
 }
 ```
 
-Inline comments on structural lines are stripped before classification.
-`#` on a data row is not treated as a comment.
+Expose as a `pub(crate)` function so parser tests can verify tokenisation independently:
+
+```rust
+pub(crate) fn lex(input: &str) -> Result<Vec<(usize, Token)>, NormError>
+```
+
+Note: tokens own their data (`String` instead of `&'a str`) because csv-core writes unescaped field content into a caller-provided buffer, so cells cannot borrow from the original input.
 
 ### Document (document.rs)
 
-Internal representation produced by pass 1 of the parser.
+Internal representation produced by pass 1 of the parser. All types are `pub(crate)` so unit tests within the crate can construct them directly for pass 2 testing, while integration tests in `tests/` go through the public API only.
 
 ```rust
-struct Document {
-    root_array: bool,
-    sections: Vec<Section>,
+pub(crate) struct Document {
+    pub(crate) root_array: bool,
+    pub(crate) sections: Vec<Section>,
 }
 
-struct Section {
-    name: String,
-    array: bool,
-    header: Vec<String>,  // empty for array sections
-    rows: Vec<Row>,
+pub(crate) struct Section {
+    pub(crate) name: String,
+    pub(crate) array: bool,
+    pub(crate) header: Vec<String>,  // empty for array sections
+    pub(crate) rows: Vec<Row>,
 }
 
-struct Row {
-    line: usize,
-    cells: Vec<String>,
+pub(crate) struct Row {
+    pub(crate) line: usize,
+    pub(crate) cells: Vec<String>,
 }
 ```
 
 ### Parser (parser.rs)
+
+Expose each pass as a separate `pub(crate)` function for independent testing:
+
+```rust
+pub(crate) fn collect_document(input: &str) -> Result<Document, NormError>  // pass 1
+pub(crate) fn resolve(doc: &Document) -> Result<Value, NormError>           // pass 2
+```
+
+Pass 1 can be tested by verifying the `Document` structure without checking JSON output. Pass 2 can be tested by constructing `Document` values directly without parsing NORM text.
 
 Pass 1: lex the input, collect all sections into a Document. Validate structure during collection:
 - Root declaration present and valid
@@ -168,7 +189,13 @@ Pass 2: starting from the root section, resolve references and reconstruct serde
 - Detect circular references (track the resolution chain; error if a row or section is visited twice)
 - Detect unreachable sections (any section not visited during pass 2)
 
-Value mapping:
+Value mapping — extract as a standalone `pub(crate)` function for focused unit testing of quoting edge cases (`"42"` vs `42`, `"@tags"` vs `@tags`, `""` vs empty cell):
+
+```rust
+pub(crate) fn map_cell(cell: &str) -> CellValue
+```
+
+Mapping rules:
 - Quoted string → JSON string (strip outer quotes, unescape doubled quotes)
 - Bare number (JSON number syntax) → JSON number
 - `true` / `false` → JSON boolean
@@ -238,16 +265,26 @@ Exit codes:
 ## Dependencies
 
 ```toml
+[features]
+default = []
+cli = ["dep:clap"]
+
 [dependencies]
 serde_json = "1"
 thiserror = "2"
-clap = { version = "4", features = ["derive"] }
+csv-core = "0.1"
+clap = { version = "4", features = ["derive"], optional = true }
 
 [dev-dependencies]
 # none required; use std test harness
+
+[[bin]]
+name = "norm"
+path = "src/bin/main.rs"
+required-features = ["cli"]
 ```
 
-`clap` is a dependency of the binary only. The library code does not import it.
+`csv-core` is used by the lexer for CSV cell splitting (handles quoted fields, embedded newlines, escaped quotes). `clap` is feature-gated behind `cli`. Library consumers never pull in clap. The binary requires `--features cli` to build or install. Library code must not import `clap`.
 
 ## Testing Strategy
 
@@ -267,7 +304,7 @@ Use the normative examples from spec.md as fixtures. Each spec example becomes o
 `encode.rs` — valid JSON values produce a NORM document that round-trips back to the same JSON.
 
 `roundtrip.rs` — encode(parse(norm_text)) produces a document that parses back to the same Value.
-Use users.json and users-edit.json from the norm-spec repo as inputs.
+Use solar_system and other spec fixtures as round-trip inputs.
 
 `errors.rs` — one test per MUST-reject rule in the spec:
 - BOM detected
@@ -288,9 +325,10 @@ Use users.json and users-edit.json from the norm-spec repo as inputs.
 
 ### Fixtures (tests/fixtures/)
 
-Copy all normative examples from spec.md as individual .norm files.
-Copy users.json and users-edit.json from the norm-spec repo.
+Copy fixture pairs from ../norm-spec/fixtures/ (11 .norm/.json pairs).
 Add a .norm file for each error test case.
+
+Caution: the spec fixtures are hand-written and have not been validated by a known-good implementation. If a test fails against a fixture, verify the fixture itself against the spec before assuming a bug in our code.
 
 ## Spec Compliance Notes
 
@@ -305,3 +343,28 @@ The following behaviours are specified by the spec but worth calling out for imp
   are technically valid but reserved-looking — no special treatment required
 - Forward references are valid; parsers must collect all sections before resolving references
 - Circular references must be detected and rejected
+
+## Current State
+
+Status: planning complete, implementation not started.
+
+Reviewed: 2026-04-08
+
+Toolchain: Rust 1.94.1 (Arch Linux pacman package).
+
+Dependencies verified (all latest majors match the plan):
+- serde_json 1.0.149 (plan: "1")
+- thiserror 2.0.18 (plan: "2")
+- clap 4.6.0 (plan: "4")
+- csv-core 0.1.13 (plan: "0.1")
+
+No source code, tests, Cargo.toml, or fixture files exist yet. The repository contains only project documentation (project.md, AGENTS.md, LICENSE, .gitignore).
+
+The norm-spec repo at ../norm-spec/ provides:
+- spec.md (v0.1) — authoritative specification, 259 lines
+- fixtures/ — 11 paired .norm/.json fixture files ready to copy into tests/fixtures/:
+  array_root, object_root, comments, csv_escaping, empty_structures, heterogeneous, nested_arrays, pk_collision, quoting, references, solar_system
+
+The solar_system fixture pair (324-line NORM, 21 KB JSON) serves as the comprehensive round-trip test.
+
+Spec and fixtures have been read and cross-checked. The project plan aligns with the spec. No discrepancies found between the planned architecture, error variants, public API, and the spec's requirements.

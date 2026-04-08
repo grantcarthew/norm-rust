@@ -8,12 +8,12 @@ Crate: `norm-codec` | Binary: `norm` | License: MPL-2.0 | Edition: 2021
 ## Commands
 
 ```sh
-cargo build              # build lib + binary
-cargo build --release    # release build
-cargo test               # run all tests
-cargo test --test parse  # run one integration test file
-cargo clippy             # lint
-cargo fmt                # format
+cargo build                  # build library only
+cargo build --features cli   # build library + binary
+cargo test                   # run all tests
+cargo test --test parse      # run one integration test file
+cargo clippy                 # lint
+cargo fmt                    # format
 ```
 
 ## Project Layout
@@ -51,13 +51,23 @@ No file I/O in the library. `parse` and `encode` return on first error. `validat
 ## Dependencies
 
 ```toml
+[features]
+default = []
+cli = ["dep:clap"]
+
 [dependencies]
 serde_json = "1"
 thiserror = "2"
-clap = { version = "4", features = ["derive"] }
+csv-core = "0.1"
+clap = { version = "4", features = ["derive"], optional = true }
+
+[[bin]]
+name = "norm"
+path = "src/bin/main.rs"
+required-features = ["cli"]
 ```
 
-`clap` is used only in `src/bin/main.rs`. Do not import it in library code.
+`csv-core` is used by the lexer for CSV cell splitting. `clap` is feature-gated behind `cli`. Do not import it in library code. Build the CLI with `cargo build --features cli`.
 
 ## CLI
 
@@ -78,10 +88,10 @@ Processes input line by line. Detects BOM and null bytes. Strips CRLF.
 Classifies lines into `Token`:
 
 ```rust
-enum Token<'a> {
+enum Token {
     RootDeclaration { array: bool },
-    SectionHeader { name: &'a str, array: bool },
-    DataRow { cells: Vec<&'a str> },
+    SectionHeader { name: String, array: bool },
+    DataRow { cells: Vec<String> },
     Blank,
     Comment,
 }
